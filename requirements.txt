@@ -1,0 +1,16 @@
+# --- Web server ---
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.0
+
+# --- Image / PDF / OCR ---
+Pillow>=10
+pytesseract>=0.3.13           # requires Tesseract binary installed separately
+
+# --- Vector store ---
+chromadb>=1.0
+
+# --- LLM providers (any one is enough; pick by setting env var) ---
+anthropic>=0.39
+openai>=1.0
+google-genai>=1.0

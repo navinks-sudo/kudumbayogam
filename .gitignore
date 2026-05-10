@@ -1,0 +1,40 @@
+# Generated / large data (re-creatable from source)
+cache/
+pdfs/
+data/
+tessdata/
+
+# Logs
+*.log
+scrape_log.txt
+scrape_run.log
+server.log
+
+# Test / scratch artifacts from initial exploration
+api_books_test.json
+basic_html.html
+sample_flipbook.html
+sample_post.json
+page1_test.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Secrets — never commit
+.env
+.env.*
+*.key
+*secret*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.claude/

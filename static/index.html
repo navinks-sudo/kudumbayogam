@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Heritage Vault — Knanaya Family Books</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@200;300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<div class="aurora"><div class="blob"></div></div>
+<div class="grain"></div>
+
+<header class="topbar">
+  <a class="brand" href="#/"><span class="brand-mark">⟁</span><span>Heritage Vault</span></a>
+  <nav class="topnav">
+    <a href="#/" data-route="home">Catalogue</a>
+  </nav>
+  <div class="topright">
+    <span id="api-state" class="conn"><span class="dot"></span><span id="api-state-text">connecting…</span></span>
+  </div>
+</header>
+
+<main id="app"></main>
+
+<!-- ========================================================================
+     Catalogue view template (the original portal)
+======================================================================== -->
+<template id="tpl-home">
+  <div class="wrap">
+    <section class="hero">
+      <div class="crest">Software · AI · Heritage Vault</div>
+      <h1 class="title">Every page bound.<br><em>Every face remembered.</em></h1>
+      <p class="lede">A multilingual archive that mirrors flipbooks from <b>knanayology.org</b>, runs <b>OCR</b> across Malayalam, Hindi, Tamil and English, ingests every page into a <b>vector store</b>, and lets you <b>chat</b> with each book or trace the <em>family tree hidden in its pages</em>.</p>
+
+      <div class="stats">
+        <div class="stat gold"><div class="lbl">Books</div><div class="val" id="s-books">—</div><div class="sub">in catalogue</div></div>
+        <div class="stat cyan"><div class="lbl">Pages</div><div class="val" id="s-pages">—</div><div class="sub">across the vault</div></div>
+        <div class="stat emerald"><div class="lbl">Bound</div><div class="val" id="s-done">—</div><div class="sub">PDFs ready</div></div>
+        <div class="stat violet"><div class="lbl">OCR'd</div><div class="val" id="s-ocr">—</div><div class="sub">books with text</div></div>
+      </div>
+    </section>
+
+    <section class="master">
+      <div class="progblock">
+        <h2>Overall progress</h2>
+        <div class="pcount"><span id="p-cur">0</span> / <span id="p-tot">0</span> pages bound</div>
+        <div class="megabar"><div id="megafill"></div></div>
+      </div>
+      <div class="actions">
+        <button class="btn primary" id="b-start">▶  Begin Archival</button>
+        <button class="btn danger" id="b-stop" disabled>■  Stop</button>
+      </div>
+    </section>
+
+    <div class="filter-row">
+      <span class="pill active" data-f="all">All</span>
+      <span class="pill" data-f="idle">Idle</span>
+      <span class="pill" data-f="downloading">Working</span>
+      <span class="pill" data-f="done">Bound</span>
+      <span class="pill" data-f="ocrd">OCR'd</span>
+      <span class="pill" data-f="error">Errors</span>
+      <input class="search" id="search" placeholder="Search book name…" />
+    </div>
+
+    <section class="grid" id="grid"></section>
+
+    <div class="footer">Source · <a href="https://www.knanayology.org/category/persons/families/" target="_blank">knanayology.org/category/persons/families/</a></div>
+  </div>
+</template>
+
+<!-- ========================================================================
+     Book detail view
+======================================================================== -->
+<template id="tpl-book">
+  <div class="wrap book-view">
+    <a class="backlink" href="#/">← Catalogue</a>
+    <header class="book-hero">
+      <div class="book-hero-text">
+        <div class="crest" id="bk-cat">Heritage Vault · Family Book</div>
+
+        <h1 class="title book-title" id="bk-title"></h1>
+        <p class="lede" id="bk-meta"></p>
+        <div class="pipeline" id="pipeline">
+          <!-- 4 pipeline chips: Bind / OCR / Ingest / Extract -->
+        </div>
+      </div>
+      <div class="book-hero-cover" id="bk-cover"></div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="pages">Pages &amp; OCR</button>
+      <button class="tab" data-tab="chat">Smart Chat</button>
+      <button class="tab" data-tab="people">People</button>
+      <button class="tab" data-tab="tree">Family Tree</button>
+    </nav>
+
+    <!-- PAGES -->
+    <section class="tab-pane active" data-pane="pages">
+      <div class="pages-layout">
+        <aside class="page-rail" id="page-rail"></aside>
+        <div class="page-reader">
+          <div class="reader-toolbar">
+            <button class="btn-sm" id="prev-page">‹ Prev</button>
+            <span class="page-num" id="page-num">—</span>
+            <button class="btn-sm" id="next-page">Next ›</button>
+            <span class="lang-pill" id="page-lang">—</span>
+            <span class="spacer"></span>
+            <select class="select" id="translate-target">
+              <option value="">Translate to…</option>
+              <option>English</option>
+              <option>Malayalam</option>
+              <option>Hindi</option>
+              <option>Tamil</option>
+            </select>
+          </div>
+          <div class="reader-body">
+            <div class="reader-image-wrap">
+              <img id="reader-img" alt="page" />
+            </div>
+            <div class="reader-text">
+              <h4>Extracted text</h4>
+              <pre id="reader-text"></pre>
+              <div id="translation-block" class="translation hidden">
+                <h4 id="translation-h">Translation</h4>
+                <pre id="translation-text"></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CHAT -->
+    <section class="tab-pane" data-pane="chat">
+      <div class="chat">
+        <div class="chat-header">
+          <div>
+            <h3>Ask the book</h3>
+            <p class="dim">Vector-retrieval over OCR'd pages · grounded answers cite page numbers</p>
+          </div>
+          <div class="chat-state" id="chat-state"></div>
+        </div>
+        <div class="chat-stream" id="chat-stream">
+          <div class="empty-chat">
+            <div class="empty-mark">✦</div>
+            <h4>Start the conversation</h4>
+            <p>Try: <em>"Who founded the family?"</em> &nbsp;·&nbsp; <em>"List births in 1920"</em> &nbsp;·&nbsp; <em>"What does page 12 describe?"</em></p>
+          </div>
+        </div>
+        <form class="chat-input" id="chat-form">
+          <input id="chat-msg" placeholder="Ask anything about this book…" autocomplete="off" />
+          <button class="btn primary" id="chat-send">Ask</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- PEOPLE -->
+    <section class="tab-pane" data-pane="people">
+      <div class="people-toolbar">
+        <input class="search" id="people-search" placeholder="Search names…" />
+        <span class="dim" id="people-count">—</span>
+        <span class="spacer"></span>
+        <button class="btn ghost" id="people-extract">⚡ Re-extract</button>
+      </div>
+      <div class="people-grid" id="people-grid"></div>
+    </section>
+
+    <!-- TREE -->
+    <section class="tab-pane" data-pane="tree">
+      <div class="tree-toolbar">
+        <div class="seg">
+          <button class="seg-btn active" data-mode="force">Constellation</button>
+          <button class="seg-btn" data-mode="radial">Radial Lineage</button>
+        </div>
+        <span class="spacer"></span>
+        <span class="legend">
+          <span class="lg lg-parent">Parent</span>
+          <span class="lg lg-spouse">Spouse</span>
+          <span class="lg lg-sibling">Sibling</span>
+          <span class="lg lg-other">Other</span>
+        </span>
+      </div>
+      <div class="tree-frame">
+        <svg id="tree-svg"></svg>
+        <div class="tree-info" id="tree-info"></div>
+      </div>
+    </section>
+  </div>
+</template>
+
+<!-- Card template -->
+<template id="tpl-card">
+  <article class="card">
+    <div class="head">
+      <div>
+        <h3 class="card-title"></h3>
+        <div class="meta"></div>
+      </div>
+      <span class="status"></span>
+    </div>
+    <div class="progress">
+      <div class="num"></div>
+      <div class="bar"><div></div></div>
+    </div>
+    <div class="pipeline-mini"></div>
+    <div class="card-actions"></div>
+  </article>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
