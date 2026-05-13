@@ -93,14 +93,44 @@
     </header>
 
     <nav class="tabs">
-      <button class="tab active" data-tab="pages">Pages &amp; OCR</button>
+      <button class="tab active" data-tab="insights">Insights</button>
+      <button class="tab" data-tab="pages">Pages &amp; OCR</button>
       <button class="tab" data-tab="chat">Smart Chat</button>
       <button class="tab" data-tab="people">People</button>
       <button class="tab" data-tab="tree">Family Tree</button>
     </nav>
 
+    <!-- INSIGHTS -->
+    <section class="tab-pane active" data-pane="insights">
+      <div id="insights-body" class="insights-body"></div>
+    </section>
+
     <!-- PAGES -->
-    <section class="tab-pane active" data-pane="pages">
+    <section class="tab-pane" data-pane="pages">
+      <div class="pages-actionbar" id="pages-actionbar">
+        <button class="btn green" id="ocr-all-btn">
+          <span class="ocr-icon">⚡</span>
+          <span class="ocr-label">Extract OCR for all pages</span>
+        </button>
+        <div class="ocr-progress" id="ocr-progress"></div>
+      </div>
+      <div class="ocr-searchbar">
+        <span class="ocr-search-icon">🔍</span>
+        <input id="ocr-search-input" placeholder="Search across all OCR text — try a name, place, or date…" autocomplete="off" />
+        <div class="ocr-search-modes">
+          <button class="ocr-mode active" data-mode="hybrid"  title="Lexical + semantic">Hybrid</button>
+          <button class="ocr-mode"        data-mode="lexical" title="Exact substring match">Exact</button>
+          <button class="ocr-mode"        data-mode="semantic" title="Meaning-based">Semantic</button>
+        </div>
+        <div class="ocr-search-stats" id="ocr-search-stats"></div>
+        <button class="ocr-search-clear" id="ocr-search-clear" title="Clear search">✕</button>
+        <div class="ocr-search-nav" id="ocr-search-nav">
+          <button class="osn-btn" id="ocr-prev-match" title="Previous match">↑</button>
+          <button class="osn-btn" id="ocr-next-match" title="Next match">↓</button>
+          <span class="osn-pos" id="ocr-match-pos"></span>
+        </div>
+      </div>
+      <div class="ocr-search-results" id="ocr-search-results"></div>
       <div class="pages-layout">
         <aside class="page-rail" id="page-rail"></aside>
         <div class="page-reader">
@@ -110,6 +140,7 @@
             <button class="btn-sm" id="next-page">Next ›</button>
             <span class="lang-pill" id="page-lang">—</span>
             <span class="spacer"></span>
+            <button class="btn-sm" id="reocr-btn" title="Re-run OCR for this page only">⟳ Re-OCR</button>
             <select class="select" id="translate-target">
               <option value="">Translate to…</option>
               <option>English</option>
@@ -143,7 +174,10 @@
             <h3>Ask the book</h3>
             <p class="dim">Vector-retrieval over OCR'd pages · grounded answers cite page numbers</p>
           </div>
-          <div class="chat-state" id="chat-state"></div>
+          <div class="chat-state-row">
+            <div class="chat-state" id="chat-state"></div>
+            <button class="btn-sm" id="chat-clear" title="Clear conversation">✕ Clear</button>
+          </div>
         </div>
         <div class="chat-stream" id="chat-stream">
           <div class="empty-chat">
@@ -176,7 +210,10 @@
         <div class="seg">
           <button class="seg-btn active" data-mode="force">Constellation</button>
           <button class="seg-btn" data-mode="radial">Radial Lineage</button>
+          <button class="seg-btn" data-mode="river">Lineage River</button>
         </div>
+        <input class="search tree-search" id="tree-search" placeholder="🔍  Find a person…" />
+        <span class="dim" id="tree-match-count"></span>
         <span class="spacer"></span>
         <span class="legend">
           <span class="lg lg-parent">Parent</span>

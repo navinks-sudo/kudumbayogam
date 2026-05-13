@@ -48,7 +48,9 @@ def load_books():
         # OCR / ingest / extract progress
         b['ocr_done'] = 0
         b['ingest_chunks'] = 0
+        b['ingest_pages_done'] = 0
         b['extract_people'] = 0
+        b['extract_pages_done'] = 0
         b['extract_status'] = 'idle'
         b['ocr_status'] = 'idle'
         b['ingest_status'] = 'idle'
@@ -105,7 +107,7 @@ def update_book(b, **changes):
 
 PUBLIC_FIELDS = ('id','title','slug','pages','base','post','status','downloaded','error',
                  'pdf_size','ocr_status','ocr_done','ingest_status','ingest_chunks',
-                 'extract_status','extract_people')
+                 'ingest_pages_done','extract_status','extract_people','extract_pages_done')
 def public_book(b):
     return {k: b.get(k) for k in PUBLIC_FIELDS}
 
@@ -185,13 +187,47 @@ def scrape_book(b):
     except Exception as e:
         update_book(b, status='error', error=f"PDF build failed: {e}")
 
+# Default: run every stage automatically after a book is bound.
+# Set AUTO_PIPELINE=0 to require manual clicks per stage.
+AUTO_PIPELINE = os.environ.get("AUTO_PIPELINE", "1") != "0"
+
+def pipeline_cascade(b):
+    """Run Bind -> OCR -> Index -> Extract sequentially for one book.
+    Resumable: each stage skipped if already done. Stops on STOP_FLAG.
+    """
+    try:
+        # 1. Bind PDF
+        if b['status'] != 'done':
+            scrape_book(b)
+        if b['status'] != 'done' or STOP_FLAG.is_set(): return
+
+        # 2. OCR
+        if b['ocr_status'] != 'done':
+            stage_ocr(b)
+        if STOP_FLAG.is_set() or b['ocr_done'] == 0: return
+
+        # 3. Vector ingest
+        if b['ingest_status'] != 'done':
+            stage_ingest(b)
+        if STOP_FLAG.is_set() or b['ingest_chunks'] == 0: return
+
+        # 4. LLM extraction (only if a key is configured)
+        if PL.llm_available() and b['extract_status'] != 'done':
+            stage_extract(b)
+    except Exception as e:
+        update_book(b, error=f"cascade: {e}\n{traceback.format_exc()[:500]}")
+
 def worker_loop(book_ids):
     try:
         for bid in book_ids:
             if STOP_FLAG.is_set(): break
             b = BOOKS_BY_ID.get(bid)
-            if not b or b['status'] == 'done': continue
-            try: scrape_book(b)
+            if not b: continue
+            try:
+                if AUTO_PIPELINE:
+                    pipeline_cascade(b)
+                elif b['status'] != 'done':
+                    scrape_book(b)
             except Exception as e:
                 update_book(b, status='error', error=f"{e}\n{traceback.format_exc()[:500]}")
     finally:
@@ -212,10 +248,16 @@ def stage_ocr(b):
 
 def stage_ingest(b):
     with book_lock(b['id']):
-        update_book(b, ingest_status='running', error=None)
+        update_book(b, ingest_status='running', error=None,
+                    ingest_chunks=0, ingest_pages_done=0)
+        def progress(done_pages, total_pages, current_chunks=0):
+            update_book(b, ingest_pages_done=done_pages, ingest_chunks=current_chunks)
         try:
-            r = PL.run_ingest(b['slug'], b['pages'])
-            update_book(b, ingest_status='done', ingest_chunks=r['chunks'])
+            r = PL.run_ingest(b['slug'], b['pages'],
+                              on_progress=progress,
+                              should_stop=lambda: STOP_FLAG.is_set())
+            update_book(b, ingest_status='done',
+                        ingest_chunks=r['chunks'], ingest_pages_done=b['pages'])
         except Exception as e:
             update_book(b, ingest_status='error', error=f"Ingest failed: {e}")
 
@@ -223,12 +265,16 @@ def stage_extract(b):
     with book_lock(b['id']):
         if not PL.llm_available():
             update_book(b, extract_status='error', error="No LLM API key configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY."); return
-        update_book(b, extract_status='running', error=None)
+        update_book(b, extract_status='running', error=None,
+                    extract_people=0, extract_pages_done=0)
+        def progress(done_pages, total_pages, current_people=0):
+            update_book(b, extract_pages_done=done_pages, extract_people=current_people)
         try:
             r = PL.run_extract(b['slug'], b['pages'],
-                               on_progress=lambda d,t: None,
+                               on_progress=progress,
                                should_stop=lambda: STOP_FLAG.is_set())
-            update_book(b, extract_status='done', extract_people=r['people'])
+            update_book(b, extract_status='done',
+                        extract_people=r['people'], extract_pages_done=b['pages'])
         except Exception as e:
             update_book(b, extract_status='error', error=f"Extract failed: {e}")
 
@@ -251,7 +297,6 @@ def api_health():
         "books": len(BOOKS),
         "llm_available": PL.llm_available(),
         "llm_provider": PL.llm_provider_name(),
-        "tessdata": str(PL.TESSDATA),
     }
 
 class StartReq(BaseModel):
@@ -304,6 +349,25 @@ def api_book_ingest(bid: int):
     threading.Thread(target=stage_ingest, args=(b,), daemon=True).start()
     return {'started': True}
 
+@app.post("/api/book/{bid}/process")
+def api_book_process(bid: int):
+    """Trigger the full Bind -> OCR -> Index -> Extract cascade for one book.
+    Idempotent: any already-completed stage is skipped."""
+    b = BOOKS_BY_ID.get(bid)
+    if not b: raise HTTPException(404)
+    threading.Thread(target=pipeline_cascade, args=(b,), daemon=True).start()
+    return {'started': True, 'auto_pipeline': True}
+
+@app.get("/api/config")
+def api_config():
+    return {
+        "auto_pipeline": AUTO_PIPELINE,
+        "llm_available": PL.llm_available(),
+        "llm_provider": PL.llm_provider_name(),
+        "ocr_engine": PL._which_ocr(),
+        "embed_engine": PL.embed_provider_name(),
+    }
+
 @app.post("/api/book/{bid}/extract")
 def api_book_extract(bid: int):
     b = BOOKS_BY_ID.get(bid)
@@ -311,9 +375,40 @@ def api_book_extract(bid: int):
     if b['ocr_done'] == 0:
         raise HTTPException(400, "Run OCR first")
     if not PL.llm_available():
-        raise HTTPException(400, "ANTHROPIC_API_KEY not set — required for relationship extraction")
+        raise HTTPException(400, "No LLM API key configured — required for relationship extraction")
     threading.Thread(target=stage_extract, args=(b,), daemon=True).start()
     return {'started': True}
+
+@app.post("/api/book/{bid}/page/{n}/reocr")
+def api_book_page_reocr(bid: int, n: int):
+    """Force a single page to be re-OCR'd (useful when one page came out degenerate)."""
+    b = BOOKS_BY_ID.get(bid)
+    if not b: raise HTTPException(404)
+    if n < 1 or n > b['pages']: raise HTTPException(404, "page out of range")
+    img = CACHE_DIR / b['slug'] / f"{n}.jpg"
+    if not img.exists(): raise HTTPException(404, "page image missing")
+    ocr_dir = ROOT / 'data' / b['slug'] / 'ocr'
+    ocr_dir.mkdir(parents=True, exist_ok=True)
+    ocr_path = ocr_dir / f"{n}.json"
+    try: result = PL.ocr_page(img)
+    except Exception as e: raise HTTPException(500, str(e))
+    result["page"] = n
+    ocr_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    return {
+        "page": n,
+        "lang": result.get("lang"),
+        "engine": result.get("engine"),
+        "text_len": len(result.get("text", "")),
+    }
+
+@app.get("/api/book/{bid}/search")
+def api_book_search(bid: int, q: str = "", mode: str = "hybrid", limit: int = 80):
+    b = BOOKS_BY_ID.get(bid)
+    if not b: raise HTTPException(404)
+    q = (q or "").strip()
+    if not q:
+        return {"query": q, "mode": mode, "total": 0, "results": []}
+    return PL.search_pages(b['slug'], q, mode=mode, limit=limit)
 
 @app.get("/api/book/{bid}/page/{n}")
 def api_book_page(bid: int, n: int):
@@ -368,6 +463,29 @@ def api_book_people(bid: int):
     if not b: raise HTTPException(404)
     data = PL.load_people(b['slug'])
     return data or {'people': [], 'relationships': []}
+
+@app.get("/api/book/{bid}/insights")
+def api_book_insights(bid: int):
+    b = BOOKS_BY_ID.get(bid)
+    if not b: raise HTTPException(404)
+    return PL.analyze(b['slug'], b['title'])
+
+@app.get("/api/book/{bid}/gedcomx")
+def api_book_gedcomx(bid: int, download: int = 0):
+    b = BOOKS_BY_ID.get(bid)
+    if not b: raise HTTPException(404)
+    # Prefer the on-disk file; if missing but people.json exists, regenerate.
+    gx = PL.load_gedcomx(b['slug'])
+    if not gx and PL.load_people(b['slug']):
+        PL.write_gedcomx(b['slug'], b['title'])
+        gx = PL.load_gedcomx(b['slug'])
+    if not gx:
+        raise HTTPException(404, "GedcomX not available — run Extract first")
+    if download:
+        path = PL.book_dir(b['slug']) / "family.gedcomx.json"
+        return FileResponse(path, media_type="application/json",
+                            filename=f"{b['slug']}.gedcomx.json")
+    return JSONResponse(gx)
 
 # -------- SSE --------
 @app.get("/api/events")

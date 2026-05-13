@@ -3,8 +3,8 @@
 A multilingual archive portal for Knanaya family-history flipbooks published on
 [knanayology.org](https://www.knanayology.org/category/persons/families/).
 
-It mirrors every flipbook as a PDF, runs **OCR** across Malayalam · Hindi · Tamil · English,
-ingests every page into a **vector store**, and lets you **chat** with each book
+It mirrors every flipbook as a PDF, runs **Gemini-vision OCR** across Malayalam · Hindi · Tamil · English,
+ingests every page into a **vector store** with Gemini embeddings, and lets you **chat** with each book
 or trace the **family tree** hidden in its pages.
 
 ![Stack](https://img.shields.io/badge/Python-3.10%2B-blue) ![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688) ![Chroma](https://img.shields.io/badge/Chroma-1.0-orange) ![LLM](https://img.shields.io/badge/LLM-Claude%20%7C%20OpenAI%20%7C%20Gemini-95c11f)
@@ -19,10 +19,10 @@ flipbook URL
    ▼  scrape — pull every page JPEG
 PDF (Pillow)
    │
-   ▼  OCR — Tesseract (mal+hin+eng+tam)
+   ▼  OCR — Gemini-2.5-flash vision (Malayalam, Hindi, Tamil, English)
 per-page text
    │
-   ▼  chunk + embed (ChromaDB ONNX MiniLM)
+   ▼  chunk + embed (Gemini gemini-embedding-001, 768-dim)
 vector store
    │
    ├──▶  Smart Chat   (RAG over book, cites page numbers)
@@ -43,42 +43,16 @@ vector store
 pip install -r requirements.txt
 ```
 
-### 2. Install Tesseract OCR
+### 2. Set a Gemini API key (required)
 
-- **Windows**: <https://github.com/UB-Mannheim/tesseract/wiki>
-- **macOS**: `brew install tesseract`
-- **Ubuntu**: `sudo apt install tesseract-ocr`
-
-The code expects the binary at `C:\Program Files\Tesseract-OCR\tesseract.exe`
-on Windows; adjust `TESS_EXE` in `pipeline.py` for other paths.
-
-### 3. Download language packs
-
-The `tessdata/` folder is `.gitignore`d. Download these files into it:
-
-```bash
-mkdir -p tessdata && cd tessdata
-for lang in mal hin eng tam; do
-  curl -L -O "https://github.com/tesseract-ocr/tessdata/raw/main/$lang.traineddata"
-done
-```
-
-### 4. Set an LLM API key (any one)
-
-The portal auto-detects whichever is set:
+OCR, embeddings, chat, and relationship extraction all go through Gemini.
 
 ```powershell
 # PowerShell
-$env:GEMINI_API_KEY    = "AIza..."          # Gemini (recommended — cheap + multilingual)
-$env:GEMINI_CHAT_MODEL = "gemini-2.5-flash-lite"
-$env:GEMINI_FAST_MODEL = "gemini-2.5-flash-lite"
-
-# OR
-$env:ANTHROPIC_API_KEY = "sk-ant-..."
-
-# OR
-$env:OPENAI_API_KEY    = "sk-proj-..."
-$env:OPENAI_CHAT_MODEL = "gpt-4o"
+$env:GEMINI_API_KEY    = "AIza..."
+$env:GEMINI_OCR_MODEL  = "gemini-2.5-flash"        # vision OCR — full flash needed
+$env:GEMINI_CHAT_MODEL = "gemini-2.5-flash"        # chat / extraction
+$env:GEMINI_FAST_MODEL = "gemini-2.5-flash"        # translation, follow-ups
 ```
 
 ```bash
@@ -86,10 +60,11 @@ $env:OPENAI_CHAT_MODEL = "gpt-4o"
 export GEMINI_API_KEY="AIza..."
 ```
 
-Provider precedence: **Anthropic > OpenAI > Gemini**.
-Force one with `LLM_PROVIDER=anthropic|openai|gemini`.
+> Anthropic / OpenAI are also wired up as alternates for chat / extraction (set
+> `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` instead), but **OCR is Gemini-only** —
+> no Tesseract, no other backend.
 
-### 5. Bootstrap the catalogue index
+### 3. Bootstrap the catalogue index
 
 If `books_index.json` isn't present, regenerate it from the live site:
 
@@ -113,9 +88,23 @@ print(len(out), 'books indexed')
 "
 ```
 
-### 6. Run
+### 4. Run
+
+**On Windows** — copy the template launcher, fill in your key, run it:
+
+```powershell
+copy run_server.example.cmd run_server.cmd
+# edit run_server.cmd and replace PUT_YOUR_KEY_HERE
+.\run_server.cmd
+```
+
+The script sets all env vars and starts the server detached. `run_server.cmd` is gitignored so your key stays local.
+
+**On macOS / Linux**:
 
 ```bash
+export GEMINI_API_KEY="AIza..."
+export GEMINI_OCR_MODEL="gemini-2.5-flash"
 python server.py
 ```
 
@@ -128,7 +117,7 @@ Open <http://127.0.0.1:5434>.
 | File | Role |
 |---|---|
 | `server.py`     | FastAPI app on port 5434, SSE event bus, scrape worker |
-| `pipeline.py`   | OCR + chunking + embeddings + LLM (Anthropic / OpenAI / Gemini) + RAG chat + relationship extraction |
+| `pipeline.py`   | Gemini OCR + chunking + Gemini embeddings + LLM chat + relationship extraction + GedcomX export |
 | `scrape_books.py` | Standalone bulk-PDF builder (CLI) |
 | `static/`       | Single-page UI: catalogue + book detail (Pages · Chat · People · Family Tree) |
 
@@ -137,10 +126,10 @@ Open <http://127.0.0.1:5434>.
 ```
 cache/<slug>/<n>.jpg          # downloaded page images (600 KB / page)
 pdfs/<slug>.pdf               # bound PDF
-data/<slug>/ocr/<n>.json      # OCR text per page
+data/<slug>/ocr/<n>.json      # OCR text per page (Gemini)
 data/<slug>/people.json       # extracted people + relationships
+data/<slug>/family.gedcomx.json # GedcomX export (auto-written after extract)
 data/chroma/                  # ChromaDB persistent vector store
-tessdata/                     # Tesseract language packs
 ```
 
 ### Endpoints (highlights)

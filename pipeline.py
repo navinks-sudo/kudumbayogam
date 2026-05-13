@@ -11,21 +11,10 @@ from pathlib import Path
 from typing import Optional, Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
-import pytesseract
 import chromadb
 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
-# -- Tesseract setup ---------------------------------------------------------
 ROOT = Path(__file__).parent.resolve()
-TESSDATA = ROOT / "tessdata"
-TESS_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-if Path(TESS_EXE).exists():
-    pytesseract.pytesseract.tesseract_cmd = TESS_EXE
-# point tesseract at our local tessdata folder so Malayalam/Hindi/Tamil work
-os.environ["TESSDATA_PREFIX"] = str(TESSDATA)
-
-# Languages we support for OCR (data files in tessdata/)
-TESS_LANGS = "mal+hin+eng+tam"
 
 # -- Storage paths -----------------------------------------------------------
 CACHE_DIR  = ROOT / "cache"
@@ -39,10 +28,85 @@ def book_dir(slug: str) -> Path:
     (d / "ocr").mkdir(parents=True, exist_ok=True)
     return d
 
-# -- ChromaDB ----------------------------------------------------------------
+# -- ChromaDB + embeddings ---------------------------------------------------
 _chroma_lock = threading.Lock()
 _chroma_client = None
-_embed_fn = DefaultEmbeddingFunction()  # ONNX MiniLM (multilingual-capable)
+GEMINI_EMBED_MODEL = os.environ.get("GEMINI_EMBED_MODEL", "gemini-embedding-001")
+EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "auto").lower()
+#   auto    → gemini if Gemini key set, else local ONNX MiniLM
+#   gemini  → force Gemini text-embedding-004
+#   local   → force local MiniLM
+
+class GeminiEmbedFn:
+    """ChromaDB-compatible embedding function backed by Gemini text-embedding-004.
+    Uses RETRIEVAL_DOCUMENT for documents and RETRIEVAL_QUERY for queries (set
+    externally via .as_query()).
+    """
+    def __init__(self, model: str = GEMINI_EMBED_MODEL, task_type: str = "RETRIEVAL_DOCUMENT"):
+        self.model = model
+        self.task_type = task_type
+
+    def name(self) -> str:                  # chromadb uses this for identification
+        return f"gemini:{self.model}"
+
+    def as_query(self) -> "GeminiEmbedFn":
+        return GeminiEmbedFn(self.model, task_type="RETRIEVAL_QUERY")
+
+    def __call__(self, input):
+        from google.genai import types
+        prov, client = llm()
+        if prov != "gemini":
+            raise RuntimeError("Gemini embeddings require GEMINI_API_KEY")
+        if isinstance(input, str):
+            input = [input]
+        out: list[list[float]] = []
+        BATCH = 100
+        for i in range(0, len(input), BATCH):
+            chunk = input[i:i+BATCH]
+            last_err = None
+            for attempt in range(4):
+                try:
+                    resp = client.models.embed_content(
+                        model=self.model,
+                        contents=chunk,
+                        config=types.EmbedContentConfig(task_type=self.task_type),
+                    )
+                    out.extend([list(e.values) for e in resp.embeddings])
+                    break
+                except Exception as e:
+                    last_err = e
+                    msg = str(e).lower()
+                    if any(s in msg for s in ("503","unavailable","overloaded","rate_limit","timeout","high demand")):
+                        time.sleep(1.5 * (attempt + 1)); continue
+                    raise
+            else:
+                raise last_err  # type: ignore
+        return out
+
+_local_embed_fn = None
+_gemini_embed_fn = None
+
+def _pick_embed_provider() -> str:
+    if EMBED_PROVIDER == "gemini":
+        if _detect_provider() != "gemini":
+            raise RuntimeError("EMBED_PROVIDER=gemini but no Gemini key configured")
+        return "gemini"
+    if EMBED_PROVIDER == "local": return "local"
+    # auto
+    return "gemini" if _detect_provider() == "gemini" else "local"
+
+def doc_embed_fn():
+    global _local_embed_fn, _gemini_embed_fn
+    if _pick_embed_provider() == "gemini":
+        if _gemini_embed_fn is None:
+            _gemini_embed_fn = GeminiEmbedFn()
+        return _gemini_embed_fn
+    if _local_embed_fn is None:
+        _local_embed_fn = DefaultEmbeddingFunction()
+    return _local_embed_fn
+
+def embed_provider_name() -> str:
+    return _pick_embed_provider()
 
 def chroma() -> chromadb.api.ClientAPI:
     global _chroma_client
@@ -54,9 +118,16 @@ def chroma() -> chromadb.api.ClientAPI:
 def collection_for(slug: str):
     name = f"book_{slug}"[:60]
     return chroma().get_or_create_collection(
-        name=name, embedding_function=_embed_fn,
+        name=name, embedding_function=doc_embed_fn(),
         metadata={"hnsw:space": "cosine"}
     )
+
+def wipe_index(slug: str) -> None:
+    """Drop the entire ChromaDB collection for one book — used when switching embed providers."""
+    try:
+        chroma().delete_collection(name=f"book_{slug}"[:60])
+    except Exception:
+        pass
 
 # -- LLM (auto-detect Anthropic / OpenAI / Gemini) ---------------------------
 # Provider precedence: ANTHROPIC_API_KEY > OPENAI_API_KEY > GEMINI_API_KEY.
@@ -71,6 +142,8 @@ OPENAI_CHAT_MODEL    = os.environ.get("OPENAI_CHAT_MODEL",    "gpt-4o-mini")
 OPENAI_FAST_MODEL    = os.environ.get("OPENAI_FAST_MODEL",    "gpt-4o-mini")
 GEMINI_CHAT_MODEL    = os.environ.get("GEMINI_CHAT_MODEL",    "gemini-2.5-flash")
 GEMINI_FAST_MODEL    = os.environ.get("GEMINI_FAST_MODEL",    "gemini-2.5-flash")
+# Vision OCR needs the full flash model — lite produces empty/degenerate output on ornamented pages
+GEMINI_OCR_MODEL     = os.environ.get("GEMINI_OCR_MODEL",     "gemini-2.5-flash")
 
 def _detect_provider() -> Optional[str]:
     forced = os.environ.get("LLM_PROVIDER", "").strip().lower()
@@ -222,18 +295,87 @@ def _llm_complete_once(system: str, messages: list[dict], max_tokens: int,
 # ============================================================================
 # Stage 1 — OCR
 # ============================================================================
+OCR_PROMPT = (
+    "You are a precise OCR engine for Indic-script family directories.\n"
+    "Read all visible PROSE TEXT on this page exactly as printed.\n"
+    "Preserve original scripts (Malayalam, Hindi, Tamil, English) — do NOT translate or transliterate.\n"
+    "Preserve line order. Use tab or pipe '|' for table column separators.\n\n"
+    "STRICT RULES:\n"
+    "  • DO NOT transcribe decorative borders or ornaments — long runs of "
+    "    'oooo', '====', '----', '••••', repeated dots, asterisks, page-edge circles "
+    "    or corner flourishes. Skip them entirely.\n"
+    "  • If you find yourself about to repeat the same character more than 10 times in a row, STOP.\n"
+    "  • Page-number badges embedded in ornaments: include only the number, not the surrounding decoration.\n"
+    "  • Stamps and watermarks: transcribe their legible text once, then move on.\n\n"
+    "Output ONLY the extracted text. No preamble, no markdown fences, no explanation."
+)
+
+_DEGEN_RE = re.compile(r'(.)\1{30,}', re.DOTALL)
+
+def _is_degenerate_ocr(text: str) -> bool:
+    """Detect OCR output stuck in a repetition loop (e.g. '00000000…')."""
+    if not text or len(text) < 40: return False
+    if _DEGEN_RE.search(text): return True
+    # any single non-whitespace char making up > 45% of the output is suspicious
+    from collections import Counter
+    chars = [c for c in text if not c.isspace()]
+    if not chars: return False
+    most, n = Counter(chars).most_common(1)[0]
+    return (n / len(chars)) > 0.45
+
+def _gemini_ocr_call(client, img_bytes: bytes, mime: str, prompt: str) -> str:
+    from google.genai import types
+    resp = client.models.generate_content(
+        model=GEMINI_OCR_MODEL,
+        contents=[
+            types.Part.from_bytes(data=img_bytes, mime_type=mime),
+            prompt,
+        ],
+        config=types.GenerateContentConfig(
+            max_output_tokens=8192,
+            temperature=0.2,                         # tiny non-zero — breaks repetition loops
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        ),
+    )
+    return (getattr(resp, "text", "") or "").strip()
+
 def ocr_page(img_path: Path) -> dict:
-    """Run Tesseract on one page; returns {text, lang, conf}."""
+    """Gemini-vision OCR (Gemini-only — Tesseract removed).
+    Up to two passes: first with the standard prompt, then with a stricter
+    one if the output came back empty or in a degenerate repetition loop.
+    """
+    if _detect_provider() != "gemini":
+        return {"text": "", "lang": "unk",
+                "engine": "none",
+                "error": "OCR requires GEMINI_API_KEY (Gemini-only)"}
     try:
-        im = Image.open(img_path)
-        im.load()
-        # try with all languages first (best accuracy on mixed Indic content)
-        text = pytesseract.image_to_string(im, lang=TESS_LANGS)
-        # detect language of text (very rough heuristic)
-        lang = detect_script(text)
-        return {"text": text.strip(), "lang": lang}
+        prov, client = llm()
+        img_bytes = img_path.read_bytes()
+        mime = "image/jpeg" if img_path.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+
+        text = _gemini_ocr_call(client, img_bytes, mime, OCR_PROMPT)
+        if (not text.strip()) or _is_degenerate_ocr(text):
+            strict = (OCR_PROMPT +
+                      "\n\nIMPORTANT: the page may have decorative borders made of small circles, "
+                      "dots or repeated symbols. IGNORE them entirely. "
+                      "Find the actual sentence text on the page and transcribe ONLY that.")
+            text2 = _gemini_ocr_call(client, img_bytes, mime, strict)
+            if text2.strip() and not _is_degenerate_ocr(text2):
+                text = text2
+            else:
+                return {"text": "", "lang": "unk",
+                        "engine": f"gemini:{GEMINI_OCR_MODEL}",
+                        "error": "Gemini returned empty or degenerate output after retry"}
+        return {"text": text, "lang": detect_script(text),
+                "engine": f"gemini:{GEMINI_OCR_MODEL}"}
     except Exception as e:
-        return {"text": "", "lang": "unk", "error": str(e)}
+        return {"text": "", "lang": "unk",
+                "engine": f"gemini:{GEMINI_OCR_MODEL}",
+                "error": f"OCR failed: {e}"}
+
+def _which_ocr() -> str:
+    """Kept for /api/config — always 'gemini' now."""
+    return "gemini"
 
 def detect_script(text: str) -> str:
     if not text: return "unk"
@@ -248,7 +390,7 @@ def detect_script(text: str) -> str:
     return max(counts, key=counts.get) if any(counts.values()) else "unk"
 
 def run_ocr(slug: str, total_pages: int, on_progress: Optional[Callable[[int, int], None]] = None,
-            should_stop: Optional[Callable[[], bool]] = None, workers: int = 3) -> dict:
+            should_stop: Optional[Callable[[], bool]] = None, workers: int = 4) -> dict:
     """OCR every page of a book. Resumable (skips already-processed pages)."""
     bdir = book_dir(slug)
     cdir = CACHE_DIR / slug
@@ -325,9 +467,11 @@ def chunk_text(text: str, chunk_size: int = 700, overlap: int = 120) -> list[str
 def run_ingest(slug: str, pages: int,
                on_progress: Optional[Callable[[int, int], None]] = None,
                should_stop: Optional[Callable[[], bool]] = None) -> dict:
-    """Chunk all OCR'd pages and store embeddings in chroma."""
+    """Chunk all OCR'd pages and store embeddings in chroma.
+    Calls on_progress(done_pages, total_pages, current_chunks) after each page
+    and again after each embedding-write batch.
+    """
     coll = collection_for(slug)
-    # wipe any existing entries for this book
     try:
         existing = coll.get(include=[])
         if existing and existing.get("ids"):
@@ -335,33 +479,49 @@ def run_ingest(slug: str, pages: int,
     except Exception:
         pass
 
+    def _emit(done: int, total: int, chunks: int):
+        if not on_progress: return
+        try: on_progress(done, total, chunks)
+        except TypeError: on_progress(done, total)
+
     ids, docs, metas = [], [], []
     for n in range(1, pages + 1):
         page = load_page_ocr(slug, n)
-        if not page or not page.get("text"): continue
-        chunks = chunk_text(page["text"])
-        for ci, c in enumerate(chunks):
-            ids.append(f"{slug}_p{n}_c{ci}")
-            docs.append(c)
-            metas.append({"slug": slug, "page": n, "lang": page.get("lang","unk"), "chunk": ci})
-        if on_progress: on_progress(n, pages)
+        if page and page.get("text"):
+            chunks = chunk_text(page["text"])
+            for ci, c in enumerate(chunks):
+                ids.append(f"{slug}_p{n}_c{ci}")
+                docs.append(c)
+                metas.append({"slug": slug, "page": n, "lang": page.get("lang","unk"), "chunk": ci})
+        _emit(n, pages, len(docs))
         if should_stop and should_stop(): break
 
     if not docs:
         return {"chunks": 0}
 
-    # add in batches
+    # Embed + write in batches. Each batch is the slowest part (Gemini API)
+    # so we emit progress after every batch as well.
     BATCH = 100
-    for i in range(0, len(docs), BATCH):
+    total_batches = (len(docs) + BATCH - 1) // BATCH
+    for bi, i in enumerate(range(0, len(docs), BATCH), 1):
         coll.add(ids=ids[i:i+BATCH], documents=docs[i:i+BATCH], metadatas=metas[i:i+BATCH])
+        # During the embed phase we map batches back to pages for nice progress.
+        # Use a synthetic "done" = pages × (bi/total_batches) so the bar moves.
+        if on_progress:
+            try: on_progress(pages, pages, len(docs))
+            except TypeError: on_progress(pages, pages)
         if should_stop and should_stop(): break
 
     return {"chunks": len(docs)}
 
-def search(slug: str, query: str, k: int = 6) -> list[dict]:
-    coll = collection_for(slug)
+def _vector_search(coll, query: str, k: int) -> list[dict]:
+    """Single-call vector search."""
     try:
-        r = coll.query(query_texts=[query], n_results=k)
+        if isinstance(doc_embed_fn(), GeminiEmbedFn):
+            q_emb = GeminiEmbedFn().as_query()([query])
+            r = coll.query(query_embeddings=q_emb, n_results=k)
+        else:
+            r = coll.query(query_texts=[query], n_results=k)
         out = []
         for i in range(len(r["ids"][0])):
             out.append({
@@ -369,10 +529,172 @@ def search(slug: str, query: str, k: int = 6) -> list[dict]:
                 "doc": r["documents"][0][i],
                 "meta": r["metadatas"][0][i],
                 "dist": r["distances"][0][i] if r.get("distances") else None,
+                "src": "vector",
             })
         return out
-    except Exception as e:
+    except Exception:
         return []
+
+def _substring_search(coll, needle: str, k: int) -> list[dict]:
+    """Literal-substring search through chunk documents — recall for exact names."""
+    try:
+        r = coll.get(where_document={"$contains": needle}, limit=k)
+        out = []
+        for i, _id in enumerate(r.get("ids", [])):
+            out.append({
+                "id": _id,
+                "doc": r["documents"][i],
+                "meta": r["metadatas"][i],
+                "dist": 0.0,             # exact match — best possible
+                "src": "substring",
+            })
+        return out
+    except Exception:
+        return []
+
+_NAME_RE = re.compile(r"\b([A-Z][a-z]{2,})\b")
+
+def _candidate_names(query: str) -> list[str]:
+    """Pull capitalized words / multi-word names out of a question.
+
+    Filters obvious English stopwords like 'Who', 'What', 'When', 'List', 'Tell'.
+    """
+    STOP = {"Who","What","When","Where","Why","How","List","Tell","Show","Did",
+            "Does","Find","Give","Name","The","Is","Are","Was","Were","And",
+            "Of","In","On","To","For","With","From","Book","Family"}
+    # find runs of capitalized words (e.g., "Tony Pathyil", "Mar Joseph")
+    tokens = []
+    for m in re.finditer(r"\b[A-Z][\w’'-]+(?:\s+[A-Z][\w’'-]+){0,3}\b", query):
+        s = m.group(0)
+        # drop sentence-initial stopwords like "Who is …"
+        if s in STOP: continue
+        first = s.split()[0]
+        if first in STOP and len(s.split()) > 1:
+            s = " ".join(s.split()[1:])
+        if s and s not in STOP: tokens.append(s)
+    # dedupe preserving order
+    seen, out = set(), []
+    for t in tokens:
+        if t.lower() not in seen:
+            seen.add(t.lower()); out.append(t)
+    return out
+
+def search_pages(slug: str, query: str, mode: str = "hybrid", limit: int = 80) -> dict:
+    """Hybrid search across OCR pages of a single book.
+
+    Returns ranked pages with snippets, match counts, and a src flag.
+    - lexical : substring matches on raw OCR text (exact recall)
+    - semantic: vector retrieval (related concepts)
+    - hybrid  : both, with lexical hits ranked above semantic
+    """
+    bdir = book_dir(slug)
+    by_page: dict[int, dict] = {}
+
+    # ---- Lexical pass — every substring match in every OCR file
+    if mode in ("lexical", "hybrid") and query.strip():
+        ql = query.lower()
+        ocr_dir = bdir / "ocr"
+        if ocr_dir.exists():
+            files = sorted(ocr_dir.glob("*.json"), key=lambda p: int(p.stem))
+            for f in files:
+                try:
+                    d = json.loads(f.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                text = d.get("text", "") or ""
+                tl = text.lower()
+                # collect all match positions
+                positions = []
+                i = 0
+                while True:
+                    j = tl.find(ql, i)
+                    if j < 0: break
+                    positions.append(j)
+                    i = j + max(len(ql), 1)
+                if not positions:
+                    continue
+                page = int(f.stem)
+                snippets = []
+                for p in positions[:3]:
+                    s = max(0, p - 60)
+                    e = min(len(text), p + len(query) + 100)
+                    snippets.append({
+                        "before": text[s:p],
+                        "match":  text[p:p + len(query)],
+                        "after":  text[p + len(query):e],
+                    })
+                by_page[page] = {
+                    "page": page,
+                    "match_count": len(positions),
+                    "snippets": snippets,
+                    "src": "lexical",
+                    "lang": d.get("lang", "unk"),
+                }
+
+    # ---- Semantic pass — vector retrieval over indexed chunks
+    if mode in ("semantic", "hybrid") and query.strip():
+        try:
+            hits = search(slug, query, k=12)
+        except Exception:
+            hits = []
+        for h in hits:
+            p = h.get("meta", {}).get("page")
+            if p is None: continue
+            if p in by_page: continue        # lexical wins
+            by_page[p] = {
+                "page": p,
+                "match_count": 0,
+                "snippets": [{
+                    "before": "",
+                    "match":  "",
+                    "after":  (h.get("doc") or "")[:240],
+                }],
+                "src": "semantic",
+                "dist": h.get("dist"),
+                "lang": h.get("meta", {}).get("lang", "unk"),
+            }
+
+    sorted_results = sorted(
+        by_page.values(),
+        key=lambda r: (
+            0 if r["src"] == "lexical" else 1,
+            -r["match_count"],
+            r.get("dist") or 1.0,
+            r["page"],
+        ),
+    )
+    return {
+        "query": query,
+        "mode": mode,
+        "total": len(sorted_results),
+        "lexical_count": sum(1 for r in sorted_results if r["src"] == "lexical"),
+        "semantic_count": sum(1 for r in sorted_results if r["src"] == "semantic"),
+        "results": sorted_results[:limit],
+    }
+
+def search(slug: str, query: str, k: int = 12) -> list[dict]:
+    """Hybrid retrieval: vector + literal substring on detected proper nouns.
+    Substring hits take priority (dist=0), then vector hits sorted by distance.
+    """
+    coll = collection_for(slug)
+    pool: dict[str, dict] = {}
+
+    # 1) primary vector pass
+    for hit in _vector_search(coll, query, k=max(k, 16)):
+        pool[hit["id"]] = hit
+
+    # 2) per-name substring passes (recall for specific people)
+    for name in _candidate_names(query)[:5]:
+        for hit in _substring_search(coll, name, k=8):
+            # substring hit wins over vector if same chunk
+            pool[hit["id"]] = {**pool.get(hit["id"], {}), **hit}
+
+    # 3) sort: substring matches first (dist=0), then vector by distance asc
+    sorted_hits = sorted(
+        pool.values(),
+        key=lambda h: (0 if h.get("src") == "substring" else 1, h.get("dist") or 1.0),
+    )
+    return sorted_hits[:k]
 
 # ============================================================================
 # Stage 3 — Translation
@@ -389,17 +711,62 @@ def translate_text(text: str, target_lang: str = "English") -> str:
 # Stage 4 — Smart chat (RAG)
 # ============================================================================
 def chat(slug: str, book_title: str, message: str, history: list[dict]) -> dict:
-    hits = search(slug, message, k=8)
-    context = "\n\n".join(
-        f"[Page {h['meta']['page']}]\n{h['doc']}" for h in hits
-    ) or "(no relevant passages indexed)"
+    hits = search(slug, message, k=14)
+    # Annotate retrieval method so the model knows substring hits are exact-match
+    context_parts = []
+    for h in hits:
+        tag = "EXACT" if h.get("src") == "substring" else "SEMANTIC"
+        context_parts.append(f"[Page {h['meta']['page']} · {tag}]\n{h['doc']}")
+    context = "\n\n".join(context_parts) or "(no relevant passages indexed)"
 
-    sys = (f"You are a knowledgeable assistant for the family-history book "
-           f"\"{book_title}\". Answer ONLY using the provided passages. "
-           "If the answer is not in the passages, say so plainly. "
-           "Cite page numbers like [p.42]. "
-           "If a passage is in Malayalam/Hindi/Tamil, you may quote and translate it briefly. "
-           "Be concise and factual.")
+    # Also surface a compact derived view of the people graph so questions like
+    # "who is the founder", "who is the most connected person", etc. can be
+    # answered from the same source of truth as the Insights / Tree tabs.
+    graph_view = ""
+    try:
+        ana = analyze(slug, book_title)
+        if not ana.get("empty"):
+            lines = []
+            m = ana["metrics"]
+            lines.append(f"Derived graph: {m['people']} people, {m['relationships']} relationships, "
+                         f"{m['generations']} generations, {m['branches']} branches.")
+            if ana.get("founders"):
+                lines.append("Founders (no recorded parents): " +
+                             "; ".join(f"{f['name']} ({f['descendants']} desc.)" for f in ana["founders"][:5]))
+            if ana.get("hubs"):
+                lines.append("Most connected: " +
+                             "; ".join(f"{h['name']} ({h['degree']} ties)" for h in ana["hubs"][:5]))
+            graph_view = "\n".join(lines)
+    except Exception:
+        pass
+
+    sys = (
+        f"You are a precise genealogist assistant for the family-history book \"{book_title}\".\n\n"
+        "You are given (a) the most relevant OCR passages with page numbers, each tagged "
+        "[Page N · EXACT] for exact-string matches or [Page N · SEMANTIC] for vector matches, "
+        "and (b) a derived people-graph summary computed from the same book.\n\n"
+        "CITATION RULES — strict:\n"
+        "  • Every factual sentence MUST end with the page citation in the form [p.N].\n"
+        "  • Cite EXACTLY the page where the fact appears in the passages — never invent a number.\n"
+        "  • If a fact appears on multiple pages, cite the lowest page number, optionally followed by others: [p.5][p.12].\n"
+        "  • [Page N · EXACT] passages are highest priority — the name you asked about literally appears there.\n\n"
+        "HOW TO ANSWER:\n"
+        "  1. Prefer facts you can cite from the passages with [p.N]. Cite EVERY factual claim.\n"
+        "  2. Where compact family-tree notation appears in OCR — 'Tony+Bindhu' means Tony married Bindhu; "
+        "     'Tessley and Tony' inside a children list means both are children of the named parents above. Read these correctly.\n"
+        "  3. You MAY synthesise across passages — e.g. if a page lists generations or "
+        "     identifies an ancestor with no parents, conclude they are the earliest known [p.N].\n"
+        "  4. You MAY use the derived graph for structural questions (founder, hub, generations, branches), "
+        "     but state it as 'derived from the book structure'.\n"
+        "  5. If a person's existence is supported only by an EXACT match in a passage, say so — "
+        "     do not deny their existence just because no narrative explains them.\n"
+        "  6. If neither passages nor the derived graph support an answer, reply exactly:\n"
+        "       'The book does not say.'\n"
+        "  7. When a name is in Malayalam/Hindi/Tamil, give it once in original script, then transliterate.\n"
+        "  8. Be concise. Use bullets for multiple items. No preamble, no sign-off.\n"
+    )
+    if graph_view:
+        context = f"{context}\n\n[DERIVED PEOPLE-GRAPH SUMMARY]\n{graph_view}"
 
     msgs = []
     for h in history[-8:]:
@@ -408,13 +775,34 @@ def chat(slug: str, book_title: str, message: str, history: list[dict]) -> dict:
                  "content": f"Question: {message}\n\nRelevant passages from the book:\n{context}"})
 
     answer = _llm_complete(sys, msgs, max_tokens=1024, fast=False)
-    return {"answer": answer, "sources": [{"page": h["meta"]["page"], "snippet": h["doc"][:240]} for h in hits]}
+
+    # Auto-generate three precise follow-up questions grounded in the same passages.
+    followups: list[str] = []
+    try:
+        f_sys = ("Given the user's question, the assistant's answer, and source passages, "
+                 "propose THREE concise, specific follow-up questions the reader is most likely "
+                 "to ask next about THIS BOOK. Output ONLY a JSON array of three short strings, no preamble.")
+        f_body = (f"Question:\n{message}\n\nAnswer:\n{answer}\n\nPassages:\n{context}")
+        raw = _llm_complete(f_sys, [{"role":"user","content":f_body}],
+                            max_tokens=300, fast=True, want_json=False)
+        raw = _strip_json(raw)
+        if raw.startswith('['):
+            arr = json.loads(raw)
+            followups = [s for s in arr if isinstance(s, str)][:3]
+    except Exception:
+        pass
+
+    return {
+        "answer": answer,
+        "sources": [{"page": h["meta"]["page"], "snippet": h["doc"][:240]} for h in hits],
+        "followups": followups,
+    }
 
 # ============================================================================
 # Stage 5 — People & relationship extraction
 # ============================================================================
-EXTRACT_SYSTEM = """You are an expert genealogist analyzing a family history book.
-Extract a JSON object describing every person mentioned and their relationships.
+EXTRACT_SYSTEM = """You are an expert genealogist analyzing a family-directory book.
+Extract a JSON object describing EVERY person mentioned and their relationships.
 
 Output ONLY valid JSON, no preamble, no markdown fences. Schema:
 {
@@ -430,13 +818,21 @@ Output ONLY valid JSON, no preamble, no markdown fences. Schema:
   ]
 }
 
+CRITICAL — common compact notations in family directories. Treat EVERY name token as a person, even when it appears in shorthand:
+  • "A+B"           → A and B are a married COUPLE (spouse relationship between A and B)
+  • "A & B" or "A and B" inside a list of children → A and B are SIBLINGS (siblings of each other, children of the row above)
+  • Numbered list under a couple "1. X, 2. Y, 3. Z" → X, Y, Z are CHILDREN of that couple
+  • Indented sub-list under a person → those names are descendants of that person
+  • "Name (place)" → the location is a note, the person is "Name"
+
 Rules:
-- Use STABLE ids: p1, p2, p3, ... Reuse the same id when the same person appears in multiple passages.
-- Only include people clearly named.
+- Use STABLE ids p1, p2, p3, … Reuse the same id when the same person appears in multiple passages.
+- Capture EVERY single named person — even when the entry is just one or two words like "Tony+Bindhu" or "Tessley and Tony". Do not skip short entries.
 - For non-Latin names, also Romanize and put the original in name_native.
+- Surnames inferred from family branch headings should be appended to first-name-only entries (e.g. inside a "Pathiyil" subsection, "Tony+Bindhu" → "Tony Pathiyil" and "Bindhu" — Bindhu is the spouse marrying in, so keep just "Bindhu" unless her surname is given).
 - Skip vague references ("his uncle", "the priest") unless a name follows.
 - If a relationship is ambiguous, use type "other" and explain in notes.
-- Limit to the most important ~80 people if there are too many.
+- Do NOT cap the people list — this is a comprehensive family directory and may have hundreds of names.
 """
 
 def _strip_json(s: str) -> str:
@@ -453,6 +849,26 @@ def _strip_json(s: str) -> str:
         j = s.rfind("}")
         if j != -1: s = s[:j+1]
     return s.strip()
+
+def _canonicalize_rel(a: str, b: str, t: str) -> tuple[str, str, str]:
+    """Normalize a relationship so inverse / symmetric duplicates collapse.
+
+    Rules:
+      child(a→b)    ==  parent(b→a)   →  store as parent
+      father/mother(a→b)               →  store as parent
+      son/daughter(a→b)                →  store as parent(b→a)
+      spouse, sibling                  →  symmetric, sort endpoints
+    """
+    t = (t or "other").lower().strip()
+    if t in ("father", "mother"):                t = "parent"
+    if t in ("son", "daughter"):                 t = "child"
+    if t in ("husband", "wife", "partner"):      t = "spouse"
+    if t in ("brother", "sister"):               t = "sibling"
+
+    if t == "child":      return (b, a, "parent")
+    if t in ("spouse", "sibling"):
+        return tuple(sorted([a, b])) + (t,)      # type: ignore
+    return (a, b, t)
 
 def _merge_people(merged: dict, new_data: dict):
     """Merge new extraction into running people/relationships dict."""
@@ -489,15 +905,15 @@ def _merge_people(merged: dict, new_data: dict):
         a = id_map.get(r.get("from"))
         b = id_map.get(r.get("to"))
         if not a or not b or a == b: continue
-        key = (a, b, r.get("type","other"))
-        if key in merged["rel_seen"]: continue
-        merged["rel_seen"].add(key)
+        ca, cb, ct = _canonicalize_rel(a, b, r.get("type", "other"))
+        if (ca, cb, ct) in merged["rel_seen"]: continue
+        merged["rel_seen"].add((ca, cb, ct))
         merged["relationships"].append({
-            "from": a, "to": b, "type": r.get("type","other"),
+            "from": ca, "to": cb, "type": ct,
             "notes": r.get("notes"), "pages": r.get("pages") or [],
         })
 
-def run_extract(slug: str, pages: int, batch_pages: int = 8,
+def run_extract(slug: str, pages: int, batch_pages: int = 4,
                 on_progress: Optional[Callable[[int, int], None]] = None,
                 should_stop: Optional[Callable[[], bool]] = None) -> dict:
     """Walk OCR text in batches, ask LLM to extract people, merge.
@@ -538,7 +954,6 @@ def run_extract(slug: str, pages: int, batch_pages: int = 8,
             try:
                 data = json.loads(_strip_json(raw))
             except json.JSONDecodeError as je:
-                # save raw output for diagnosis
                 dbg = bdir / f"extract_raw_{lo}_{hi}.txt"
                 dbg.write_text(raw or "(empty)", encoding="utf-8")
                 raise RuntimeError(f"JSON parse failed ({je}); raw saved to {dbg.name}") from je
@@ -548,7 +963,22 @@ def run_extract(slug: str, pages: int, batch_pages: int = 8,
             last_err = str(e)
             print(f"extract batch {lo}-{hi} failed:", e)
 
-        if on_progress: on_progress(hi, pages)
+        # Persist partial results after every batch so the UI shows people streaming in.
+        try:
+            partial = {
+                "people": list(merged["people"].values()),
+                "relationships": merged["relationships"],
+            }
+            out_path.write_text(json.dumps(partial, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+        except Exception as e:
+            print(f"partial people.json write failed: {e}")
+
+        # Report progress with the running people count so the UI can update live.
+        if on_progress:
+            try: on_progress(hi, pages, len(merged["people"]))
+            except TypeError:
+                on_progress(hi, pages)
 
     # If every attempted batch failed, raise so caller marks status=error.
     if batches_attempted > 0 and batches_ok == 0:
@@ -561,12 +991,391 @@ def run_extract(slug: str, pages: int, batch_pages: int = 8,
         "relationships": merged["relationships"],
     }
     out_path.write_text(json.dumps(final, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Also write a GedcomX file — that becomes the canonical interchange format.
+    try:
+        write_gedcomx(slug)
+    except Exception as e:
+        print(f"GedcomX write failed for {slug}: {e}")
+
     return {"people": len(final["people"]),
             "relationships": len(final["relationships"]),
             "batches_ok": batches_ok,
             "batches_attempted": batches_attempted}
 
+# ============================================================================
+# Stage 5b — GedcomX export
+# https://github.com/FamilySearch/gedcomx — open genealogy interchange format
+# ============================================================================
+GX_NS = "http://gedcomx.org/"
+
+def to_gedcomx(slug: str, book_title: str = "") -> dict:
+    """Convert our people.json into a GedcomX document."""
+    data = load_people(slug) or {"people": [], "relationships": []}
+    persons = []
+    for p in data["people"]:
+        person: dict = {"id": p["id"], "private": False}
+        # primary name (Latin transliteration)
+        names = []
+        if p.get("name"):
+            names.append({"nameForms": [{"fullText": p["name"], "lang": "en"}]})
+        if p.get("name_native"):
+            names.append({"nameForms": [{"fullText": p["name_native"], "lang": "ml"}]})
+        if names: person["names"] = names
+        # gender
+        g = p.get("gender")
+        if g == "M":
+            person["gender"] = {"type": f"{GX_NS}Male"}
+        elif g == "F":
+            person["gender"] = {"type": f"{GX_NS}Female"}
+        else:
+            person["gender"] = {"type": f"{GX_NS}Unknown"}
+        # facts
+        facts = []
+        if p.get("birth"):
+            facts.append({"type": f"{GX_NS}Birth", "date": {"original": str(p["birth"])}})
+        if p.get("death"):
+            facts.append({"type": f"{GX_NS}Death", "date": {"original": str(p["death"])}})
+        if facts: person["facts"] = facts
+        # notes (from extraction)
+        if p.get("notes"):
+            person["notes"] = [{"text": p["notes"], "lang": "en"}]
+        # source references — link back to the original page numbers
+        pages = p.get("pages") or []
+        if pages:
+            person["sources"] = [
+                {"description": f"#src-page-{n}"} for n in pages
+            ]
+        persons.append(person)
+
+    # GedcomX relationship types
+    type_map = {
+        "parent":  f"{GX_NS}ParentChild",       # person1 = parent, person2 = child
+        "spouse":  f"{GX_NS}Couple",
+    }
+
+    rels: list[dict] = []
+    for i, r in enumerate(data.get("relationships", [])):
+        a, b, t = r.get("from"), r.get("to"), (r.get("type") or "other").lower()
+        gx_type = type_map.get(t)
+        if not gx_type:
+            # Map sibling / other to a custom URI per GedcomX extension guidance
+            gx_type = f"{GX_NS}Custom/{t or 'other'}"
+        rel = {
+            "id": f"r{i+1}",
+            "type": gx_type,
+            "person1": {"resource": f"#{a}"},
+            "person2": {"resource": f"#{b}"},
+        }
+        if r.get("notes"):
+            rel["notes"] = [{"text": r["notes"]}]
+        if r.get("pages"):
+            rel["sources"] = [{"description": f"#src-page-{n}"} for n in r["pages"]]
+        rels.append(rel)
+
+    # Source descriptions per referenced page (so downstream readers can resolve)
+    referenced_pages: set = set()
+    for p in data["people"]:
+        for n in (p.get("pages") or []): referenced_pages.add(n)
+    for r in data.get("relationships", []):
+        for n in (r.get("pages") or []): referenced_pages.add(n)
+    source_descriptions = [
+        {
+            "id": f"src-page-{n}",
+            "titles": [{"value": f"{book_title or slug} — page {n}"}],
+            "resourceType": f"{GX_NS}PhysicalArtifact",
+        } for n in sorted(referenced_pages)
+    ]
+
+    return {
+        "description": book_title or slug,
+        "lang": "en",
+        "attribution": {
+            "contributor": {"resource": "#heritage-vault"},
+            "modified": int(time.time() * 1000),
+            "changeMessage": "Auto-extracted from OCR by Gemini",
+        },
+        "persons": persons,
+        "relationships": rels,
+        "sourceDescriptions": source_descriptions,
+    }
+
+def write_gedcomx(slug: str, book_title: str = "") -> Path:
+    gx = to_gedcomx(slug, book_title)
+    path = book_dir(slug) / "family.gedcomx.json"
+    path.write_text(json.dumps(gx, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+def load_gedcomx(slug: str) -> Optional[dict]:
+    path = book_dir(slug) / "family.gedcomx.json"
+    if not path.exists(): return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def _dedupe_relationships(rels: list[dict]) -> list[dict]:
+    """Canonicalize + dedupe a relationship list (in-memory only)."""
+    seen: set = set()
+    out: list[dict] = []
+    for r in rels or []:
+        a, b = r.get("from"), r.get("to")
+        if not a or not b or a == b: continue
+        ca, cb, ct = _canonicalize_rel(a, b, r.get("type", "other"))
+        if (ca, cb, ct) in seen: continue
+        seen.add((ca, cb, ct))
+        out.append({
+            "from": ca, "to": cb, "type": ct,
+            "notes": r.get("notes"),
+            "pages": r.get("pages") or [],
+        })
+    return out
+
 def load_people(slug: str) -> Optional[dict]:
     p = book_dir(slug) / "people.json"
     if not p.exists(): return None
-    return json.loads(p.read_text(encoding="utf-8"))
+    data = json.loads(p.read_text(encoding="utf-8"))
+    raw_rels = data.get("relationships", [])
+    deduped = _dedupe_relationships(raw_rels)
+    # rewrite to disk if we made a change (one-time migration)
+    if len(deduped) != len(raw_rels):
+        data["relationships"] = deduped
+        try: p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception: pass
+    else:
+        data["relationships"] = deduped
+    return data
+
+# ============================================================================
+# Stage 6 — Analytics & insights derived from the extracted graph
+# ============================================================================
+PARENT_TYPES   = {"parent", "child", "father", "mother", "son", "daughter"}
+SPOUSE_TYPES   = {"spouse", "wife", "husband", "partner"}
+SIBLING_TYPES  = {"sibling", "brother", "sister"}
+
+def _build_graph(data: dict) -> dict:
+    """Build adjacency views for fast traversal."""
+    people = {p["id"]: p for p in data.get("people", [])}
+    parents_of  = {pid: set() for pid in people}     # pid -> set of parent ids
+    children_of = {pid: set() for pid in people}
+    spouses_of  = {pid: set() for pid in people}
+    siblings_of = {pid: set() for pid in people}
+    all_neighbors = {pid: set() for pid in people}
+
+    for r in data.get("relationships", []):
+        a, b, t = r.get("from"), r.get("to"), (r.get("type") or "").lower()
+        if a not in people or b not in people or a == b:
+            continue
+        all_neighbors[a].add(b); all_neighbors[b].add(a)
+        if t in ("parent", "father", "mother"):
+            parents_of[b].add(a);   children_of[a].add(b)
+        elif t in ("child", "son", "daughter"):
+            parents_of[a].add(b);   children_of[b].add(a)
+        elif t in SPOUSE_TYPES:
+            spouses_of[a].add(b);   spouses_of[b].add(a)
+        elif t in SIBLING_TYPES:
+            siblings_of[a].add(b);  siblings_of[b].add(a)
+    return {
+        "people": people,
+        "parents_of": parents_of, "children_of": children_of,
+        "spouses_of": spouses_of, "siblings_of": siblings_of,
+        "all_neighbors": all_neighbors,
+    }
+
+def _generations(g: dict) -> dict[str, int]:
+    """Assign generation index (0 = founders) using longest-parent-chain depth."""
+    parents_of = g["parents_of"]
+    memo: dict[str, int] = {}
+    stack_in: set[str] = set()
+    def depth(pid):
+        if pid in memo: return memo[pid]
+        if pid in stack_in: return 0   # cycle guard
+        stack_in.add(pid)
+        ps = parents_of.get(pid, set())
+        d = 0 if not ps else 1 + max(depth(p) for p in ps)
+        stack_in.discard(pid)
+        memo[pid] = d
+        return d
+    for pid in g["people"]: depth(pid)
+    return memo
+
+def _connected_components(g: dict) -> list[set[str]]:
+    """Undirected components — each = one branch/family unit."""
+    nbrs = g["all_neighbors"]
+    seen, comps = set(), []
+    for pid in g["people"]:
+        if pid in seen: continue
+        comp, stack = set(), [pid]
+        while stack:
+            x = stack.pop()
+            if x in seen: continue
+            seen.add(x); comp.add(x)
+            stack.extend(n for n in nbrs.get(x, ()) if n not in seen)
+        comps.append(comp)
+    return sorted(comps, key=len, reverse=True)
+
+def _name_for(g: dict, pid: str) -> str:
+    return g["people"][pid].get("name") or pid
+
+def analyze(slug: str, book_title: str) -> dict:
+    """Compute insights, suggestions, and branch metadata from people.json.
+    Pure derivation — no LLM calls, deterministic, fast.
+    """
+    data = load_people(slug) or {"people": [], "relationships": []}
+    g = _build_graph(data)
+    n = len(g["people"])
+    rels = data.get("relationships", [])
+
+    if n == 0:
+        return {"empty": True, "summary": "No people extracted yet."}
+
+    # --- generations
+    gen = _generations(g)
+    max_gen = max(gen.values()) if gen else 0
+    gen_counts: dict[int, int] = {}
+    for d in gen.values(): gen_counts[d] = gen_counts.get(d, 0) + 1
+
+    # --- founders (people with no recorded parents)
+    founders = sorted(
+        [pid for pid, ps in g["parents_of"].items() if not ps],
+        key=lambda pid: (-len(g["children_of"][pid]), -len(g["all_neighbors"][pid]))
+    )
+
+    # --- hubs (most connected = central figures)
+    hubs = sorted(g["people"], key=lambda pid: -len(g["all_neighbors"][pid]))
+
+    # --- branches (connected components)
+    comps = _connected_components(g)
+    components = []
+    for ci, comp in enumerate(comps):
+        # name a branch by its highest-degree member
+        elders = sorted(comp, key=lambda pid: (-len(g["all_neighbors"][pid]),
+                                               gen.get(pid, 99)))
+        head = elders[0] if elders else None
+        components.append({
+            "id": f"b{ci+1}",
+            "size": len(comp),
+            "head": _name_for(g, head) if head else None,
+            "head_id": head,
+            "members": list(comp),
+            "generations": (max((gen[m] for m in comp), default=0) -
+                            min((gen[m] for m in comp), default=0) + 1) if comp else 0,
+        })
+
+    # --- orphans (people with no relationships)
+    orphans = [pid for pid in g["people"] if not g["all_neighbors"][pid]]
+
+    # --- couples (any spouse pair)
+    couples = []
+    seen_pairs: set = set()
+    for pid, partners in g["spouses_of"].items():
+        for q in partners:
+            key = tuple(sorted([pid, q]))
+            if key in seen_pairs: continue
+            seen_pairs.add(key)
+            couples.append((_name_for(g, key[0]), _name_for(g, key[1])))
+
+    # --- gender split
+    gender = {"M": 0, "F": 0, "?": 0}
+    for p in g["people"].values():
+        gender[p.get("gender") if p.get("gender") in ("M","F") else "?"] += 1
+
+    # --- relationship type breakdown
+    rel_types: dict[str, int] = {}
+    for r in rels:
+        t = (r.get("type") or "other").lower()
+        rel_types[t] = rel_types.get(t, 0) + 1
+
+    # --- people referenced on most pages (importance signal)
+    pages_per = sorted(
+        [(pid, len(p.get("pages") or [])) for pid, p in g["people"].items()],
+        key=lambda x: -x[1]
+    )
+
+    # --- density: edges per node
+    density = round(len(rels) / max(n, 1), 2)
+
+    # --- chat suggestions derived from real data
+    suggestions = []
+    if founders:
+        suggestions.append(f"Tell me about {_name_for(g, founders[0])} — what does the book say about them?")
+    if hubs and len(g["all_neighbors"][hubs[0]]) >= 2:
+        suggestions.append(f"List all relatives of {_name_for(g, hubs[0])}.")
+    if len(comps) > 1:
+        suggestions.append(
+            f"What links the {comps[0].__len__()}-person branch led by "
+            f"{components[0]['head']} to the smaller branches?"
+        )
+    if couples:
+        suggestions.append(f"What is the marriage of {couples[0][0]} and {couples[0][1]}? When did it take place?")
+    if max_gen >= 2:
+        suggestions.append(f"Trace the lineage across all {max_gen + 1} generations.")
+    if not suggestions:
+        suggestions = [
+            "Who is the head of this family?",
+            "List everyone mentioned by occupation.",
+            "What dates are mentioned in this book?",
+        ]
+
+    # --- narrative summary (one paragraph, fully derived)
+    bits = [
+        f"This book records **{n}** people connected by **{len(rels)}** relationships",
+    ]
+    if max_gen >= 1:
+        bits.append(f"spanning **{max_gen + 1}** generations")
+    if len(comps) > 1:
+        bits.append(f"split across **{len(comps)}** family branches")
+    if founders:
+        bits.append(f"with **{_name_for(g, founders[0])}** as the earliest documented ancestor")
+    if hubs:
+        bits.append(f"and **{_name_for(g, hubs[0])}** as the most connected figure"
+                    f" ({len(g['all_neighbors'][hubs[0]])} ties)")
+    summary = ", ".join(bits) + "."
+
+    # --- branch assignment for tree colouring
+    branch_of = {}
+    for ci, comp in enumerate(comps):
+        for pid in comp: branch_of[pid] = ci
+
+    return {
+        "empty": False,
+        "summary": summary,
+        "metrics": {
+            "people": n,
+            "relationships": len(rels),
+            "generations": max_gen + 1,
+            "branches": len(comps),
+            "orphans": len(orphans),
+            "couples": len(couples),
+            "density": density,
+            "gender": gender,
+        },
+        "rel_types": rel_types,
+        "founders": [
+            {"id": pid, "name": _name_for(g, pid),
+             "children": len(g["children_of"][pid]),
+             "descendants": _count_descendants(g, pid)}
+            for pid in founders[:6]
+        ],
+        "hubs": [
+            {"id": pid, "name": _name_for(g, pid),
+             "degree": len(g["all_neighbors"][pid]),
+             "generation": gen.get(pid, 0)}
+            for pid in hubs[:6]
+        ],
+        "components": components[:8],
+        "gen_counts": [{"gen": k, "count": v} for k, v in sorted(gen_counts.items())],
+        "most_mentioned": [
+            {"id": pid, "name": _name_for(g, pid), "pages": cnt}
+            for pid, cnt in pages_per[:6] if cnt > 0
+        ],
+        "suggestions": suggestions,
+        "branch_of": branch_of,
+        "generation_of": gen,
+    }
+
+def _count_descendants(g: dict, root: str) -> int:
+    seen, stack = set(), [root]
+    while stack:
+        x = stack.pop()
+        for c in g["children_of"].get(x, ()):
+            if c not in seen:
+                seen.add(c); stack.append(c)
+    return len(seen)

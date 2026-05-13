@@ -2,7 +2,6 @@
 cache/
 pdfs/
 data/
-tessdata/
 
 # Logs
 *.log
@@ -31,6 +30,9 @@ venv/
 .env.*
 *.key
 *secret*
+# Local launcher script (contains GEMINI_API_KEY in plaintext).
+# Template lives in run_server.example.cmd
+run_server.cmd
 
 # IDE / OS
 .vscode/
