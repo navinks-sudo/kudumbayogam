@@ -858,20 +858,47 @@ async function sendChat(forced) {
       });
     }
 
-    // sources (collapsed by default)
+    // ---- Rich sources block ----
     if (resp.sources?.length) {
+      const citedPages = new Set(
+        [...thinking.querySelectorAll('.cite')].map(e => +e.dataset.page)
+      );
+      const exactCount = resp.sources.filter(s => s.match === 'exact').length;
+
       const wrap = document.createElement('details');
       wrap.className = 'sources-block';
-      const seen = new Set();
-      const uniq = resp.sources.filter(s => !seen.has(s.page) && seen.add(s.page));
-      wrap.innerHTML = `<summary>${uniq.length} source page${uniq.length===1?'':'s'} consulted</summary>`;
-      const list = document.createElement('div'); list.className = 'sources';
-      for (const s of uniq) {
-        const e = document.createElement('div');
-        e.className = 'src';
-        e.innerHTML = `<span class="src-pg">p.${s.page}</span> <span class="src-text">${escapeHtml(s.snippet.slice(0, 160))}…</span>`;
-        e.onclick = () => { $('.tab[data-tab="pages"]').click(); loadPage(s.page); };
-        list.appendChild(e);
+      wrap.open = true;       // sources visible by default now
+      wrap.innerHTML = `<summary>
+        <span class="sb-icon">📚</span>
+        <span class="sb-text"><b>${resp.sources.length}</b> source page${resp.sources.length===1?'':'s'}</span>
+        ${exactCount ? `<span class="sb-tag sb-tag-exact">${exactCount} exact</span>` : ''}
+        ${resp.sources.length - exactCount ? `<span class="sb-tag sb-tag-sem">${resp.sources.length - exactCount} related</span>` : ''}
+      </summary>`;
+      const list = document.createElement('div'); list.className = 'sources-grid';
+      for (const s of resp.sources) {
+        const card = document.createElement('div');
+        card.className = `src-card src-card-${s.match}${citedPages.has(s.page) ? ' src-card-cited' : ''}`;
+        const langTag = s.lang && s.lang !== 'unk' ? `<span class="src-lang">${s.lang.toUpperCase()}</span>` : '';
+        const scorePct = Math.round((s.score || 0) * 100);
+        card.innerHTML = `
+          <div class="src-card-head">
+            <span class="src-pg-lg">p.${s.page}</span>
+            <div class="src-card-tags">
+              <span class="src-type src-type-${s.match}">${s.match === 'exact' ? '◉ Exact match' : '◌ Related'}</span>
+              ${langTag}
+              ${citedPages.has(s.page) ? '<span class="src-cited">★ Cited in answer</span>' : ''}
+            </div>
+          </div>
+          <div class="src-snippet">${escapeHtml(s.snippet)}…</div>
+          <div class="src-card-foot">
+            <div class="src-score-bar" title="relevance ${scorePct}%">
+              <div style="width:${scorePct}%"></div>
+            </div>
+            ${s.snippet_count > 1 ? `<span class="src-chunks">${s.snippet_count} chunks consulted</span>` : ''}
+            <span class="src-open">Open page →</span>
+          </div>`;
+        card.onclick = () => { $('.tab[data-tab="pages"]').click(); loadPage(s.page); };
+        list.appendChild(card);
       }
       wrap.appendChild(list);
       thinking.appendChild(wrap);
@@ -1249,6 +1276,9 @@ function _kinSet(pid, adj) {
   return set;
 }
 
+// Default cap to keep big books snappy; toggleable from the toolbar.
+const TREE_NODE_CAP = 350;
+
 function renderTree() {
   const data = state.people;
   const svg = d3.select('#tree-svg');
@@ -1266,26 +1296,41 @@ function renderTree() {
   const h = svg.node().clientHeight;
   const mode = state.treeMode || 'force';
 
-  // ---- gradient defs (gendered + neutral) ----
-  const defs = svg.append('defs');
-  function addGrad(id, c0, c1) {
-    const g = defs.append('radialGradient').attr('id', id);
-    g.append('stop').attr('offset','0%').attr('stop-color', c0);
-    g.append('stop').attr('offset','100%').attr('stop-color', c1);
-  }
-  addGrad('nodeGrad',  '#b9d973', '#3d5a0e');
-  addGrad('nodeGradF', '#f0789f', '#5e1a30');
-  addGrad('nodeGradM', '#7ddae8', '#0e3e4a');
-
-  const root = svg.append('g').attr('class','viewport');
-  const zoom = d3.zoom().scaleExtent([0.15, 4]).on('zoom', e => root.attr('transform', e.transform));
-  svg.call(zoom);
-
-  const nodes = data.people.map(p => ({...p}));
-  const idx = Object.fromEntries(nodes.map(n => [n.id, n]));
-  const links = data.relationships
-    .filter(r => idx[r.from] && idx[r.to])
+  // Build full node + link arrays (used for the "show all" toggle)
+  const allNodes = data.people.map(p => ({...p}));
+  const idxAll = Object.fromEntries(allNodes.map(n => [n.id, n]));
+  const allLinks = data.relationships
+    .filter(r => idxAll[r.from] && idxAll[r.to])
     .map(r => ({source: r.from, target: r.to, type: r.type, notes: r.notes}));
+
+  // ---- cap nodes by connectivity for performance ----
+  const showAll = !!state.treeShowAll;
+  let nodes, links;
+  if (showAll || allNodes.length <= TREE_NODE_CAP) {
+    nodes = allNodes; links = allLinks;
+  } else {
+    // keep the most-connected N nodes
+    const deg = new Map(allNodes.map(n => [n.id, 0]));
+    for (const l of allLinks) { deg.set(l.source, (deg.get(l.source)||0)+1); deg.set(l.target, (deg.get(l.target)||0)+1); }
+    const keep = new Set(
+      [...allNodes].sort((a, b) => (deg.get(b.id)||0) - (deg.get(a.id)||0)).slice(0, TREE_NODE_CAP).map(n => n.id)
+    );
+    nodes = allNodes.filter(n => keep.has(n.id));
+    links = allLinks.filter(l => keep.has(l.source) && keep.has(l.target));
+  }
+  const idx = Object.fromEntries(nodes.map(n => [n.id, n]));
+
+  // toolbar: show-all toggle status
+  const cap = $('#tree-cap-info');
+  if (cap) {
+    cap.innerHTML = (allNodes.length > TREE_NODE_CAP && !showAll)
+      ? `showing top ${nodes.length} of ${allNodes.length} · <a href="#" id="tree-show-all">show all</a>`
+      : (allNodes.length > TREE_NODE_CAP
+          ? `showing all ${allNodes.length} · <a href="#" id="tree-show-top">show top ${TREE_NODE_CAP}</a>`
+          : `${nodes.length} people`);
+    $('#tree-show-all')?.addEventListener('click', e => { e.preventDefault(); state.treeShowAll = true; renderTree(); });
+    $('#tree-show-top')?.addEventListener('click', e => { e.preventDefault(); state.treeShowAll = false; renderTree(); });
+  }
 
   const gen = _generationsMap(nodes, links);
   nodes.forEach(n => n._gen = gen.get(n.id) || 0);
@@ -1294,123 +1339,125 @@ function renderTree() {
 
   const branchPalette = ['#95c11f','#5dcfe5','#f0789f','#c9a13a','#a78bfa','#5fb878','#e07b4a','#7faedb'];
   const branchOf = state.insights?.branch_of || {};
+  const nodeFill = d => {
+    if (d.gender === 'F') return '#f0789f';
+    if (d.gender === 'M') return '#7ddae8';
+    return '#b9d973';
+  };
   const branchStroke = d => {
     const i = branchOf[d.id]; return i == null ? 'rgba(255,255,255,.45)' : branchPalette[i % branchPalette.length];
   };
 
-  // ---- layout per mode ----
-  if (mode === 'force') {
-    treeSim = d3.forceSimulation(nodes)
-      .force('charge',    d3.forceManyBody().strength(-320))
-      .force('center',    d3.forceCenter(w/2, h/2))
-      .force('link',      d3.forceLink(links).id(d=>d.id).distance(d => d.type==='parent'?90:70).strength(0.55))
-      .force('collision', d3.forceCollide().radius(34));
-  } else if (mode === 'radial') {
-    const cx = w/2, cy = h/2, Rmax = Math.min(w,h)/2 - 60;
-    const groups = new Map();
-    nodes.forEach(n => {
-      if (!groups.has(n._gen)) groups.set(n._gen, []);
-      groups.get(n._gen).push(n);
-    });
-    for (const [g, list] of groups) {
-      const r = (g/maxGen) * Rmax;
-      list.forEach((n, i) => {
-        const a = (i / list.length) * Math.PI * 2;
-        n.fx = cx + Math.cos(a) * r; n.fy = cy + Math.sin(a) * r;
-      });
-    }
-    treeSim = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink(links).id(d=>d.id).distance(50).strength(0.15))
-      .force('charge', d3.forceManyBody().strength(-90));
-  } else if (mode === 'river') {
-    // Generations left→right; within each generation, nodes spread vertically.
-    const colW = Math.max(180, Math.floor((w - 80) / (maxGen + 1)));
-    const groups = new Map();
-    nodes.forEach(n => {
-      if (!groups.has(n._gen)) groups.set(n._gen, []);
-      groups.get(n._gen).push(n);
-    });
+  const root = svg.append('g').attr('class','viewport');
+  const zoom = d3.zoom().scaleExtent([0.15, 4]).on('zoom', e => root.attr('transform', e.transform));
+  svg.call(zoom);
 
-    // Decorative generation bands behind everything
-    const bandG = root.insert('g', ':first-child').attr('class','river-bands');
-    for (let g = 0; g <= maxGen; g++) {
-      bandG.append('rect')
-        .attr('x', 40 + g * colW - colW/2 + 18)
-        .attr('y', 0).attr('width', colW - 36).attr('height', h)
-        .attr('class', 'river-band-bg')
-        .attr('fill', g % 2 === 0 ? 'rgba(149,193,31,.025)' : 'rgba(125,218,232,.025)');
-      bandG.append('text')
-        .attr('x', 40 + g * colW).attr('y', 22).attr('text-anchor','middle')
-        .attr('class','river-band-label')
-        .text('Gen ' + g);
-    }
-
-    for (const [g, list] of groups) {
-      // sort by branch + name for visual cohesion within a generation
-      list.sort((a,b) => (branchOf[a.id]||0) - (branchOf[b.id]||0) || (a.name||'').localeCompare(b.name||''));
-      const spacing = (h - 80) / Math.max(list.length, 1);
-      list.forEach((n, i) => {
-        n.fx = 40 + g * colW;
-        n.fy = 60 + i * spacing + (i % 2 === 0 ? 0 : 12); // small jitter for readability
+  // ---- LAYOUT: compute positions ONCE, then render statically ----
+  function computeStaticLayout() {
+    if (mode === 'force') {
+      const sim = d3.forceSimulation(nodes)
+        .force('charge',    d3.forceManyBody().strength(-260))
+        .force('center',    d3.forceCenter(w/2, h/2))
+        .force('link',      d3.forceLink(links).id(d=>d.id).distance(d => d.type==='parent'?80:60).strength(0.6))
+        .force('collision', d3.forceCollide().radius(22))
+        .stop();
+      // run synchronously for a fixed number of ticks, then freeze
+      const ticks = Math.min(250, Math.ceil(Math.log(sim.alphaMin()) / Math.log(1 - sim.alphaDecay())));
+      for (let i = 0; i < ticks; i++) sim.tick();
+    } else if (mode === 'radial') {
+      const cx = w/2, cy = h/2, Rmax = Math.min(w,h)/2 - 60;
+      const groups = new Map();
+      nodes.forEach(n => {
+        if (!groups.has(n._gen)) groups.set(n._gen, []);
+        groups.get(n._gen).push(n);
       });
+      for (const [g, list] of groups) {
+        const r = g === 0 ? 0 : (g/maxGen) * Rmax;
+        list.forEach((n, i) => {
+          const a = (i / Math.max(list.length, 1)) * Math.PI * 2;
+          n.x = cx + Math.cos(a) * r; n.y = cy + Math.sin(a) * r;
+        });
+      }
+    } else { // river
+      const colW = Math.max(180, Math.floor((w - 80) / (maxGen + 1)));
+      const groups = new Map();
+      nodes.forEach(n => {
+        if (!groups.has(n._gen)) groups.set(n._gen, []);
+        groups.get(n._gen).push(n);
+      });
+      // band decoration (light, no continuous reflow)
+      const bandG = root.append('g').attr('class','river-bands');
+      for (let g = 0; g <= maxGen; g++) {
+        bandG.append('rect')
+          .attr('x', 40 + g * colW - colW/2 + 18)
+          .attr('y', 0).attr('width', colW - 36).attr('height', h)
+          .attr('class', 'river-band-bg')
+          .attr('fill', g % 2 === 0 ? 'rgba(149,193,31,.03)' : 'rgba(125,218,232,.03)');
+        bandG.append('text')
+          .attr('x', 40 + g * colW).attr('y', 22).attr('text-anchor','middle')
+          .attr('class','river-band-label')
+          .text('Gen ' + g);
+      }
+      for (const [g, list] of groups) {
+        list.sort((a,b) => (branchOf[a.id]||0) - (branchOf[b.id]||0) || (a.name||'').localeCompare(b.name||''));
+        const spacing = (h - 80) / Math.max(list.length, 1);
+        list.forEach((n, i) => {
+          n.x = 40 + g * colW;
+          n.y = 60 + i * spacing;
+        });
+      }
     }
-    treeSim = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink(links).id(d=>d.id).distance(80).strength(0.1))
-      .force('collision', d3.forceCollide().radius(30))
-      .alpha(0.4);
+    // Resolve link source/target into node objects (for static render)
+    for (const l of links) {
+      if (typeof l.source === 'string') l.source = idx[l.source] || l.source;
+      if (typeof l.target === 'string') l.target = idx[l.target] || l.target;
+    }
   }
+  computeStaticLayout();
 
-  // ---- edges ----
+  // ---- edges (drawn once with final positions) ----
   const linkGroup = root.append('g').attr('class','links');
   const link = linkGroup.selectAll('path').data(links).enter()
     .append('path')
-    .attr('class', d => 'edge ' + (['parent','spouse','sibling','child','other'].includes(d.type)?d.type:'other'));
+    .attr('class', d => 'edge ' + (['parent','spouse','sibling','child','other'].includes(d.type)?d.type:'other'))
+    .attr('d', d => {
+      const sx=d.source.x, sy=d.source.y, tx=d.target.x, ty=d.target.y;
+      if (mode === 'river') {
+        const mx = (sx + tx) / 2;
+        return `M${sx},${sy} C${mx},${sy} ${mx},${ty} ${tx},${ty}`;
+      }
+      const dx=tx-sx, dy=ty-sy, dr=Math.sqrt(dx*dx+dy*dy)*1.4;
+      return `M${sx},${sy} A${dr},${dr} 0 0,1 ${tx},${ty}`;
+    });
 
-  const labelGroup = root.append('g').attr('class','edge-labels');
-  const edgeLabel = labelGroup.selectAll('text').data(links).enter()
-    .append('text')
-    .attr('class', d => 'edge-label edge-' + (['parent','spouse','sibling','other'].includes(d.type)?d.type:'other'))
-    .attr('text-anchor','middle').attr('dy', -3)
-    .text(d => d.type);
+  // Edge labels — only render for the smaller view, they hurt perf at 1000+ edges
+  let edgeLabel = d3.select(null);
+  if (links.length <= 300) {
+    const labelGroup = root.append('g').attr('class','edge-labels');
+    edgeLabel = labelGroup.selectAll('text').data(links).enter()
+      .append('text')
+      .attr('class', d => 'edge-label edge-' + (['parent','spouse','sibling','other'].includes(d.type)?d.type:'other'))
+      .attr('text-anchor','middle').attr('dy', -3)
+      .attr('x', d => (d.source.x + d.target.x) / 2)
+      .attr('y', d => (d.source.y + d.target.y) / 2)
+      .text(d => d.type);
+  }
 
-  // ---- avatar nodes ----
+  // ---- simple nodes: one circle + one label ----
   const node = root.append('g').attr('class','nodes').selectAll('g').data(nodes).enter()
     .append('g').attr('class', d => 'node gender-' + (d.gender||'?'))
-    .call(d3.drag()
-      .on('start', (e,d) => { if (!e.active) treeSim.alphaTarget(0.25).restart(); d.fx=d.x; d.fy=d.y; })
-      .on('drag',  (e,d) => { d.fx=e.x; d.fy=e.y; })
-      .on('end',   (e,d) => { if (!e.active) treeSim.alphaTarget(0);
-                              if (mode === 'force') { d.fx=null; d.fy=null; } })
-    );
+    .attr('transform', d => `translate(${d.x},${d.y})`);
 
-  // outer ring (branch color)
   node.append('circle')
-    .attr('r', d => 22 + Math.min(6, (d.pages?.length||0)/2))
-    .attr('class','node-ring')
-    .attr('fill', 'rgba(13,21,48,.85)')
-    .attr('stroke', branchStroke).attr('stroke-width', 2);
+    .attr('r', d => 9 + Math.min(4, (d.pages?.length||0)/4))
+    .attr('class','node-dot')
+    .attr('fill', nodeFill)
+    .attr('stroke', branchStroke)
+    .attr('stroke-width', 2);
 
-  // inner avatar
-  node.append('circle')
-    .attr('r', d => 18 + Math.min(4, (d.pages?.length||0)/3))
-    .attr('class', d => 'node-avatar gender-' + (d.gender||'?'))
-    .attr('fill', d => d.gender==='F' ? 'url(#nodeGradF)' : d.gender==='M' ? 'url(#nodeGradM)' : 'url(#nodeGrad)');
-
-  // initials inside avatar
-  node.append('text')
-    .attr('class','node-initials').attr('text-anchor','middle').attr('dy','0.36em')
-    .text(d => _initials(d.name));
-
-  // generation badge — small pill bottom-right of avatar
-  const genBadge = node.append('g').attr('class','gen-badge')
-    .attr('transform','translate(16,16)');
-  genBadge.append('circle').attr('r', 9).attr('fill','#0d1530').attr('stroke', branchStroke).attr('stroke-width',1.5);
-  genBadge.append('text').attr('text-anchor','middle').attr('dy','0.35em').text(d => d._gen);
-
-  // name label below avatar
   node.append('text').attr('class','node-label')
-    .attr('y', 38).attr('text-anchor','middle')
-    .text(d => (d.name||'').length > 24 ? d.name.slice(0,22)+'…' : d.name);
+    .attr('y', 22).attr('text-anchor','middle')
+    .text(d => (d.name||'').length > 22 ? d.name.slice(0,20)+'…' : d.name);
 
   // ---- hover preview (lightweight, transient) ----
   const info = $('#tree-info');
@@ -1564,25 +1611,7 @@ function renderTree() {
     state._treeEscBound = true;
   }
 
-  // ---- tick ----
-  treeSim.on('tick', () => {
-    link.attr('d', d => {
-      const sx=d.source.x, sy=d.source.y, tx=d.target.x, ty=d.target.y;
-      if (mode === 'river') {
-        // smooth horizontal cubic for river layout
-        const mx = (sx + tx) / 2;
-        return `M${sx},${sy} C${mx},${sy} ${mx},${ty} ${tx},${ty}`;
-      }
-      const dx=tx-sx, dy=ty-sy, dr=Math.sqrt(dx*dx+dy*dy)*1.4;
-      return `M${sx},${sy} A${dr},${dr} 0 0,1 ${tx},${ty}`;
-    });
-    edgeLabel.attr('x', d => (d.source.x + d.target.x) / 2)
-             .attr('y', d => (d.source.y + d.target.y) / 2);
-    node.attr('transform', d => `translate(${d.x},${d.y})`);
-  });
-
-  // for river mode, run sim briefly then stop so x positions stay deterministic
-  if (mode === 'river') setTimeout(() => treeSim?.alpha(0), 1200);
+  // No continuous tick — layout was pre-cooked above. Static SVG = fast.
 }
 
 // ============================================================

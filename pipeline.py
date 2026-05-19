@@ -711,12 +711,36 @@ def translate_text(text: str, target_lang: str = "English") -> str:
 # Stage 4 — Smart chat (RAG)
 # ============================================================================
 def chat(slug: str, book_title: str, message: str, history: list[dict]) -> dict:
-    hits = search(slug, message, k=14)
-    # Annotate retrieval method so the model knows substring hits are exact-match
-    context_parts = []
+    # 1) Hybrid retrieval — pull a wide net (vector + substring on detected names)
+    hits = search(slug, message, k=20)
+
+    # 2) Collect the set of pages those hits touch + how each page was found
+    page_info: dict[int, dict] = {}
     for h in hits:
-        tag = "EXACT" if h.get("src") == "substring" else "SEMANTIC"
-        context_parts.append(f"[Page {h['meta']['page']} · {tag}]\n{h['doc']}")
+        p = h["meta"]["page"]
+        rec = page_info.setdefault(p, {
+            "page": p, "lang": h["meta"].get("lang", "unk"),
+            "exact": False, "best_dist": None, "snippets": [],
+        })
+        if h.get("src") == "substring": rec["exact"] = True
+        if h.get("dist") is not None:
+            if rec["best_dist"] is None or h["dist"] < rec["best_dist"]:
+                rec["best_dist"] = h["dist"]
+        rec["snippets"].append(h["doc"])
+
+    # 3) Expand: for every matched page, load the full OCR text — gives the LLM
+    #    every fact on that page, not just the retrieved chunk.
+    pages_sorted = sorted(page_info.keys())
+    context_parts = []
+    for p in pages_sorted:
+        full = load_page_ocr(slug, p) or {}
+        text = (full.get("text") or "").strip()
+        if not text:
+            text = "\n".join(page_info[p]["snippets"])[:1500]
+        tag = "EXACT-NAME-MATCH" if page_info[p]["exact"] else "SEMANTIC-MATCH"
+        # cap each page's text so we stay under a sensible budget
+        text = text[:3500]
+        context_parts.append(f"[Page {p} · {tag}]\n{text}")
     context = "\n\n".join(context_parts) or "(no relevant passages indexed)"
 
     # Also surface a compact derived view of the people graph so questions like
@@ -742,9 +766,14 @@ def chat(slug: str, book_title: str, message: str, history: list[dict]) -> dict:
 
     sys = (
         f"You are a precise genealogist assistant for the family-history book \"{book_title}\".\n\n"
-        "You are given (a) the most relevant OCR passages with page numbers, each tagged "
-        "[Page N · EXACT] for exact-string matches or [Page N · SEMANTIC] for vector matches, "
-        "and (b) a derived people-graph summary computed from the same book.\n\n"
+        "You are given (a) the FULL OCR TEXT of every page that matches the question — each "
+        "tagged [Page N · EXACT-NAME-MATCH] if the name in the question literally appears on "
+        "that page, or [Page N · SEMANTIC-MATCH] if the page is topically related, and (b) a "
+        "derived people-graph summary computed from the same book.\n\n"
+        "BEFORE ANSWERING you MUST scan every provided page for facts relevant to the question. "
+        "Do not stop at the first match — different pages often hold complementary facts "
+        "(e.g. one page lists names, another lists spouses, a third lists children). "
+        "Combine facts across pages when they describe the same person.\n\n"
         "CITATION RULES — strict:\n"
         "  • Every factual sentence MUST end with the page citation in the form [p.N].\n"
         "  • Cite EXACTLY the page where the fact appears in the passages — never invent a number.\n"
@@ -792,9 +821,26 @@ def chat(slug: str, book_title: str, message: str, history: list[dict]) -> dict:
     except Exception:
         pass
 
+    # Build a rich source list keyed by page (deduped) with best snippet + match type
+    sources = []
+    for p in pages_sorted:
+        rec = page_info[p]
+        # pick the longest unique snippet as preview
+        best_snip = sorted(rec["snippets"], key=len, reverse=True)[0] if rec["snippets"] else ""
+        sources.append({
+            "page": p,
+            "lang": rec["lang"],
+            "match": "exact" if rec["exact"] else "semantic",
+            "score": round(1.0 - rec["best_dist"], 3) if rec["best_dist"] is not None else (1.0 if rec["exact"] else 0.0),
+            "snippet": best_snip[:300],
+            "snippet_count": len(rec["snippets"]),
+        })
+    # Sort sources: exact matches first, then by relevance score
+    sources.sort(key=lambda s: (0 if s["match"] == "exact" else 1, -s["score"], s["page"]))
+
     return {
         "answer": answer,
-        "sources": [{"page": h["meta"]["page"], "snippet": h["doc"][:240]} for h in hits],
+        "sources": sources,
         "followups": followups,
     }
 
